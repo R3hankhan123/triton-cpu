@@ -17,7 +17,7 @@ def get_native_vector_size_in_bits():
     """
     cpu_features = cpu.llvm.get_cpu_features()
     # TODO support for arm sve w/ VLA
-    if "neon" in cpu_features:
+    if "neon" in cpu_features or "vxe" in cpu_features:
         return 128
     return 512
 

@@ -145,15 +145,18 @@ public:
 using ExternElementwiseOp = triton::cpu::ExternElementwiseOp;
 
 /*
- * libsleef does not contain implementations for 2-element vectors, so we pad
- * any such vectors to size 4 instead.
+ * SLEEF has no sub-128-bit entry points. Wider targets (AVX, AVX-512) keep the
+ * historical pad-to-4, which is a real SLEEF vector there. 128-bit targets
+ * (NEON, z15 VXE2) pad to one native register: 4xf32 or 2xf64. Padding an
+ * f64 pair out to 4 would ask for a 256-bit symbol those targets do not have.
  */
 struct PadSmallVecsForSleef : public OpRewritePattern<ExternElementwiseOp> {
 public:
-  using OpRewritePattern<ExternElementwiseOp>::OpRewritePattern;
+  size_t vec_bits;
 
-  PadSmallVecsForSleef(MLIRContext *context)
-      : OpRewritePattern<ExternElementwiseOp>(context) {}
+  PadSmallVecsForSleef(MLIRContext *context, size_t native_vec_size_in_bits)
+      : OpRewritePattern<ExternElementwiseOp>(context),
+        vec_bits(native_vec_size_in_bits) {}
 
   LogicalResult matchAndRewrite(ExternElementwiseOp op,
                                 PatternRewriter &rewriter) const {
@@ -167,8 +170,17 @@ public:
     if (!elemTy.isF32() && !elemTy.isF64())
       return failure();
 
+    unsigned elemBits = elemTy.getIntOrFloatBitWidth();
+    if (elemBits == 0 || vec_bits % elemBits != 0)
+      return failure();
+    int64_t nativeElems = static_cast<int64_t>(vec_bits / elemBits);
+    // AVX and AVX-512 already have Sleef_*f4 / Sleef_*d4. Leave that pad.
+    int64_t padTo = vec_bits <= 128 ? nativeElems : 4;
+    if (padTo < 2)
+      return failure();
+
     int64_t numElems = vecTy.getNumElements();
-    if (numElems >= 4)
+    if (numElems >= padTo)
       return failure();
 
     // Create a single-element vector for shuffle to use
@@ -176,8 +188,8 @@ public:
         rewriter, loc, VectorType::get({1}, elemTy), b.undef(elemTy));
     // Assign indices such that shuffle will pad the original vector with
     // elements from the paddingVec
-    SmallVector<int64_t> indices(4);
-    for (int i = 0; i < 4; ++i) {
+    SmallVector<int64_t> indices(padTo);
+    for (int64_t i = 0; i < padTo; ++i) {
       if (i < numElems)
         indices[i] = i;
       else
@@ -190,7 +202,7 @@ public:
       newOperands.push_back(shuf.getResult());
     }
     // Update return type of extern call
-    auto newVecTy = VectorType::get({4}, elemTy);
+    auto newVecTy = VectorType::get({padTo}, elemTy);
     auto extern_elem = ExternElementwiseOp::create(
         rewriter, loc, newVecTy, newOperands, op.getSymbol(), op.getPure());
     indices.resize(numElems);
@@ -398,8 +410,8 @@ struct MathToVecLibPass
         // decomposing to fixed-width sub-vectors.
         vec_size_in_bits = 128;
         break;
-      } else if (feature == "neon") {
-        // Arm NEON is fixed 128-bit SIMD ISA.
+      } else if (feature == "neon" || feature == "vxe") {
+        // Arm NEON and IBM Z VXE are fixed 128-bit SIMD ISAs.
         vec_size_in_bits = 128;
         break;
       }
@@ -454,7 +466,7 @@ struct MathToVecLibPass
 
     patterns.add<DecomposeToNativeVecs<ExternElementwiseOp>>(
         patterns.getContext(), vec_size_in_bits);
-    patterns.add<PadSmallVecsForSleef>(patterns.getContext());
+    patterns.add<PadSmallVecsForSleef>(patterns.getContext(), vec_size_in_bits);
     patterns.add<ExternElementwiseOpConversion>(patterns.getContext());
 
     if (failed(applyPatternsGreedily(op, std::move(patterns))))

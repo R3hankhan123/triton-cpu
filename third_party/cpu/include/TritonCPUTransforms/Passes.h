@@ -42,12 +42,20 @@ std::unique_ptr<OperationPass<ModuleOp>> createConvertDotToAMX();
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertDotToAMX(bool convertInt8, bool convertFp16, bool convertBf16);
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotToFMA();
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertDotToFMA(unsigned nativeVectorBitWidth);
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotGeneric();
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertDotToNanokernel(std::string cpuFeatures = "");
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createUnrollAndReorderElementwiseOps(std::string cpuFeatures = "");
+
+// Loop over leading vector dimensions and split the innermost dimension into
+// native-width registers. Straight-line unrolling of vLLM tiles is too large
+// for SystemZ codegen.
+std::unique_ptr<OperationPass<ModuleOp>>
+createSplitWideVectors(unsigned nativeVectorBitWidth);
 
 std::unique_ptr<OperationPass<ModuleOp>> createCanonicalize();
 

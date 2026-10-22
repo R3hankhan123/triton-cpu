@@ -288,6 +288,13 @@ class CPUBackend(BaseBackend):
             cpu.passes.ttcpuir.add_split_wide_vectors(pm, 128)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
+            # Wide masked loads/stores become thousands of per-lane branches
+            # when LLVM scalarizes them on SystemZ (no masked vector memory
+            # instructions). Decompose into an all-true fast path (unmasked
+            # load/store) and a chunked 128-bit fallback.
+            cpu.passes.ttcpuir.add_lower_wide_masked_memory_ops(pm, 128)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
         cpu.passes.ttcpuir.add_lower_affine(pm)
         passes.convert.add_scf_to_cf(pm)
         passes.convert.add_index_to_llvmir(pm)

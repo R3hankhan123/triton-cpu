@@ -201,6 +201,13 @@ void init_triton_cpu_passes_ttcpuir(py::module_ &m) {
             mlir::triton::cpu::createSplitWideVectors(nativeVectorBitWidth));
       },
       py::arg("pm"), py::arg("native_vector_bit_width"));
+  m.def(
+      "add_lower_wide_masked_memory_ops",
+      [](mlir::PassManager &pm, unsigned nativeVectorBitWidth) {
+        pm.addPass(mlir::triton::cpu::createLowerWideMaskedMemoryOps(
+            nativeVectorBitWidth));
+      },
+      py::arg("pm"), py::arg("native_vector_bit_width"));
   m.def("add_vector_to_scf", [](mlir::PassManager &pm, bool full_unroll,
                                 unsigned target_rank, bool lower_tensors) {
     mlir::VectorTransferToSCFOptions opts;

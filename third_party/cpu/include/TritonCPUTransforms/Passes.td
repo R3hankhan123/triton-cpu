@@ -241,6 +241,41 @@ def UnrollAndReorderElementwiseOps : Pass<"triton-cpu-unroll-and-reorder-element
                              "mlir::scf::SCFDialect"];
 }
 
+def LowerWideMaskedMemoryOps : Pass<"triton-cpu-lower-wide-masked-memory-ops", "mlir::ModuleOp"> {
+    let summary = "Lower wide masked loads/stores to a fast unmasked path plus chunked fallback.";
+    let description = [{
+        Targets with narrow vector registers (e.g. 128-bit VXE on SystemZ)
+        have no masked vector memory instructions. LLVM scalarizes a wide
+        masked load/store into per-lane branches — catastrophic for compile
+        time when BLOCK_SIZE is large.
+
+        This pass rewrites each vector.maskedload / vector.maskedstore wider
+        than one native register into:
+          (a) a fast path that tests `vector.reduction <and>` over the mask
+              and emits a plain unmasked load or store (the common case for
+              full tiles), and
+          (b) a slow path that loops over register-width chunks doing one
+              small masked op per chunk. LLVM still scalarizes the small op
+              but only into a handful of branches inside a loop, not
+              thousands in straight-line code.
+
+        Ops that already fit in one native register are left alone.
+    }];
+
+    let options = [
+        Option<"nativeVectorBitWidth", "native-vector-bit-width",
+               "unsigned", /*default*/"128",
+               "Width of a native vector register in bits.">,
+    ];
+
+    let constructor = "mlir::triton::cpu::createLowerWideMaskedMemoryOps()";
+
+    let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::memref::MemRefDialect",
+                             "mlir::scf::SCFDialect",
+                             "mlir::vector::VectorDialect"];
+}
+
 def Canonicalize : Pass<"triton-cpu-canonicalize", "mlir::ModuleOp"> {
     let summary = "Canonicalization pass.";
     let description = [{

@@ -59,6 +59,11 @@ createUnrollAndReorderElementwiseOps(std::string cpuFeatures = "");
 std::unique_ptr<OperationPass<ModuleOp>>
 createSplitWideVectors(unsigned nativeVectorBitWidth);
 
+// Lower wide masked loads/stores to a fast unmasked path plus a chunked
+// fallback for narrow-vector targets (e.g. 128-bit VXE on SystemZ).
+std::unique_ptr<OperationPass<ModuleOp>>
+createLowerWideMaskedMemoryOps(unsigned nativeVectorBitWidth = 128);
+
 std::unique_ptr<OperationPass<ModuleOp>> createCanonicalize();
 
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotOpToUkernelOps(

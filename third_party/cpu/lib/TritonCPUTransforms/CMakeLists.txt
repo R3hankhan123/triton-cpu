@@ -10,6 +10,7 @@ add_triton_library(TritonCPUTransforms
     ConvertUnsupportedOps.cpp
     ConvertVectorContractToArmNeonBFMMLA.cpp
     DecomposeFpConversions.cpp
+    LowerWideMaskedMemoryOps.cpp
     OptimizeMasks.cpp
     UnrollAndReorderElementwiseOps.cpp
     SplitWideVectors.cpp

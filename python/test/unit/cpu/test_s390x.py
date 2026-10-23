@@ -58,3 +58,28 @@ def test_s390x_vector_add_and_dot(device):
     torch.testing.assert_close(c, a @ b, atol=1e-4, rtol=1e-4)
     # Vector FP multiply-and-add, the VXE FMA the dot lowering emits.
     assert "vfmasb" in dot_meta.asm["asm"]
+
+
+@pytest.mark.skipif(not _running_on_s390x(), reason="s390x CPU backend only")
+@pytest.mark.parametrize("block", [32, 1024, 8192])
+def test_s390x_masked_load_store_large_block(block, device):
+    import torch
+
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def masked_add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        x = tl.load(x_ptr + offs, mask=mask, other=1.0)
+        y = tl.load(y_ptr + offs, mask=mask, other=2.0)
+        tl.store(out_ptr + offs, x + y, mask=mask)
+
+    # A partial last block exercises the chunked fallback path.
+    n = 2 * block + block // 2 + 1
+    x = torch.randn(n, dtype=torch.float32, device=device)
+    y = torch.randn(n, dtype=torch.float32, device=device)
+    out = torch.full((n, ), -1.0, dtype=torch.float32, device=device)
+    masked_add_kernel[(triton.cdiv(n, block), )](x, y, out, n, BLOCK=block)
+    torch.testing.assert_close(out, x + y)

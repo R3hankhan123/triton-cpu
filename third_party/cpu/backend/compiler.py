@@ -283,16 +283,13 @@ class CPUBackend(BaseBackend):
         full_unroll = self.cpu_arch != "s390x"
         cpu.passes.ttcpuir.add_vector_to_scf(pm, full_unroll, 1, False)
         if self.cpu_arch == "s390x":
+            # SystemZ has no masked loads/stores, so LLVM scalarizes them with
+            # a branch per lane. Do the wide ones in register-sized chunks
+            # before splitting, or BLOCK_SIZE=8192 kernels spill for minutes.
+            cpu.passes.ttcpuir.add_lower_wide_masked_memory_ops(pm, 128)
             # vLLM tiles are far wider than a 128-bit VXE register. Split them
             # here so SystemZ codegen is not handed illegal vectors.
             cpu.passes.ttcpuir.add_split_wide_vectors(pm, 128)
-            passes.common.add_canonicalizer(pm)
-            passes.common.add_cse(pm)
-            # Wide masked loads/stores become thousands of per-lane branches
-            # when LLVM scalarizes them on SystemZ (no masked vector memory
-            # instructions). Decompose into an all-true fast path (unmasked
-            # load/store) and a chunked 128-bit fallback.
-            cpu.passes.ttcpuir.add_lower_wide_masked_memory_ops(pm, 128)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
         cpu.passes.ttcpuir.add_lower_affine(pm)

@@ -102,6 +102,28 @@ SmallVector<Value> offsetLastIndex(OpBuilder &b, Location loc,
   return res;
 }
 
+// Gather/scatter indices are vector values, so a dynamic chunk cannot be sliced
+// out of them directly. Spill the vector once in the entry block and reload one
+// register per iteration instead.
+Value createIndexAlloca(OpBuilder &b, Location loc, Operation *op,
+                        VectorType indexTy) {
+  return createEntryAlloca(
+      b, loc, op,
+      MemRefType::get({indexTy.getDimSize(0)}, indexTy.getElementType()));
+}
+
+// The flat form ConvertMemoryOps emits: a 1-D index vector covering the same
+// lanes as the data vector. Returns the chunk width, or 0 if not applicable.
+int64_t getWideIndexChunk(VectorType dataTy, VectorType indexTy,
+                          unsigned nativeBitWidth) {
+  int64_t chunk = getChunkSize(dataTy, nativeBitWidth);
+  if (!chunk || indexTy.getRank() != 1 ||
+      indexTy.getDimSize(0) != dataTy.getDimSize(0) ||
+      !indexTy.getElementType().isInteger())
+    return 0;
+  return chunk;
+}
+
 // Rewrite a wide masked load as
 //   if (all lanes active) plain vector load
 //   else loop over native-width chunks doing small masked loads
@@ -226,6 +248,123 @@ struct LoopWideMaskedStore : public OpRewritePattern<vector::MaskedStoreOp> {
   unsigned nativeBitWidth;
 };
 
+// LLVM expands llvm.masked.gather/scatter into one conditional access per
+// lane, so a wide gather/scatter has the same scalarization problem as a wide
+// masked load. Walk the spilled index vector in register-sized chunks so the
+// expansion happens once inside a loop instead of once per lane.
+struct LoopWideGather : public OpRewritePattern<vector::GatherOp> {
+  LoopWideGather(MLIRContext *context, unsigned nativeBitWidth)
+      : OpRewritePattern(context), nativeBitWidth(nativeBitWidth) {}
+
+  LogicalResult matchAndRewrite(vector::GatherOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isa<MemRefType>(op.getBase().getType()))
+      return failure();
+    VectorType vecTy = op.getVectorType();
+    VectorType indexTy = op.getIndexVectorType();
+    int64_t chunk = getWideIndexChunk(vecTy, indexTy, nativeBitWidth);
+    if (!chunk || !op->getParentOfType<FunctionOpInterface>())
+      return failure();
+
+    Location loc = op.getLoc();
+    int64_t width = vecTy.getDimSize(0);
+    auto chunkTy = VectorType::get({chunk}, vecTy.getElementType());
+    auto chunkIndexTy = VectorType::get({chunk}, indexTy.getElementType());
+
+    Value buf = createDataAlloca(rewriter, loc, op, vecTy, op.getBase());
+    Value indexBuf = createIndexAlloca(rewriter, loc, op, indexTy);
+    Value maskBuf = createMaskAlloca(rewriter, loc, op, op.getMaskVectorType());
+
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value upper = arith::ConstantIndexOp::create(rewriter, loc, width);
+    Value step = arith::ConstantIndexOp::create(rewriter, loc, chunk);
+
+    vector::StoreOp::create(rewriter, loc, op.getPassThru(), buf,
+                            bufIndices(buf, zero, zero));
+    vector::StoreOp::create(rewriter, loc, op.getIndices(), indexBuf,
+                            ValueRange{zero});
+    storeMask(rewriter, loc, op.getMask(), maskBuf, zero);
+
+    scf::ForOp::create(
+        rewriter, loc, zero, upper, step, ValueRange{},
+        [&](OpBuilder &b, Location loc, Value iv, ValueRange) {
+          Value chunkMask = loadMaskChunk(b, loc, maskBuf, iv, chunk);
+          Value chunkIndex = vector::LoadOp::create(b, loc, chunkIndexTy,
+                                                    indexBuf, ValueRange{iv});
+          Value chunkPass = vector::LoadOp::create(b, loc, chunkTy, buf,
+                                                   bufIndices(buf, zero, iv));
+          Value vec = vector::GatherOp::create(
+              b, loc, chunkTy, op.getBase(), op.getOffsets(), chunkIndex,
+              chunkMask, chunkPass);
+          vector::StoreOp::create(b, loc, vec, buf, bufIndices(buf, zero, iv));
+          scf::YieldOp::create(b, loc);
+        });
+
+    Value vec = vector::LoadOp::create(rewriter, loc, vecTy, buf,
+                                       bufIndices(buf, zero, zero));
+    rewriter.replaceOp(op, vec);
+    return success();
+  }
+
+  unsigned nativeBitWidth;
+};
+
+// Same as LoopWideGather, for scatter. There is no result to rebuild: the
+// value, indices and mask are spilled once and replayed chunk by chunk.
+struct LoopWideScatter : public OpRewritePattern<vector::ScatterOp> {
+  LoopWideScatter(MLIRContext *context, unsigned nativeBitWidth)
+      : OpRewritePattern(context), nativeBitWidth(nativeBitWidth) {}
+
+  LogicalResult matchAndRewrite(vector::ScatterOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isa<MemRefType>(op.getBase().getType()))
+      return failure();
+    VectorType vecTy = op.getVectorType();
+    VectorType indexTy = op.getIndexVectorType();
+    int64_t chunk = getWideIndexChunk(vecTy, indexTy, nativeBitWidth);
+    if (!chunk || !op->getParentOfType<FunctionOpInterface>())
+      return failure();
+
+    Location loc = op.getLoc();
+    int64_t width = vecTy.getDimSize(0);
+    auto chunkTy = VectorType::get({chunk}, vecTy.getElementType());
+    auto chunkIndexTy = VectorType::get({chunk}, indexTy.getElementType());
+
+    Value buf = createDataAlloca(rewriter, loc, op, vecTy, op.getBase());
+    Value indexBuf = createIndexAlloca(rewriter, loc, op, indexTy);
+    Value maskBuf = createMaskAlloca(rewriter, loc, op, op.getMaskVectorType());
+
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value upper = arith::ConstantIndexOp::create(rewriter, loc, width);
+    Value step = arith::ConstantIndexOp::create(rewriter, loc, chunk);
+
+    vector::StoreOp::create(rewriter, loc, op.getValueToStore(), buf,
+                            bufIndices(buf, zero, zero));
+    vector::StoreOp::create(rewriter, loc, op.getIndices(), indexBuf,
+                            ValueRange{zero});
+    storeMask(rewriter, loc, op.getMask(), maskBuf, zero);
+
+    scf::ForOp::create(
+        rewriter, loc, zero, upper, step, ValueRange{},
+        [&](OpBuilder &b, Location loc, Value iv, ValueRange) {
+          Value chunkMask = loadMaskChunk(b, loc, maskBuf, iv, chunk);
+          Value chunkIndex = vector::LoadOp::create(b, loc, chunkIndexTy,
+                                                    indexBuf, ValueRange{iv});
+          Value chunkVal = vector::LoadOp::create(b, loc, chunkTy, buf,
+                                                  bufIndices(buf, zero, iv));
+          vector::ScatterOp::create(b, loc, TypeRange{}, op.getBase(),
+                                    op.getOffsets(), chunkIndex, chunkMask,
+                                    chunkVal, IntegerAttr{});
+          scf::YieldOp::create(b, loc);
+        });
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+  unsigned nativeBitWidth;
+};
+
 struct LowerWideMaskedMemoryOps
     : public triton::cpu::impl::LowerWideMaskedMemoryOpsBase<
           LowerWideMaskedMemoryOps> {
@@ -240,8 +379,8 @@ struct LowerWideMaskedMemoryOps
     ModuleOp mod = getOperation();
 
     RewritePatternSet patterns(context);
-    patterns.add<LoopWideMaskedLoad, LoopWideMaskedStore>(context,
-                                                          nativeVectorBitWidth);
+    patterns.add<LoopWideMaskedLoad, LoopWideMaskedStore, LoopWideGather,
+                 LoopWideScatter>(context, nativeVectorBitWidth);
     if (failed(mlir::applyPatternsGreedily(mod, std::move(patterns))))
       return signalPassFailure();
   }

@@ -242,12 +242,13 @@ def UnrollAndReorderElementwiseOps : Pass<"triton-cpu-unroll-and-reorder-element
 }
 
 def LowerWideMaskedMemoryOps : Pass<"triton-cpu-lower-wide-masked-memory-ops", "mlir::ModuleOp"> {
-    let summary = "Lower wide masked loads/stores to a fast unmasked path plus chunked fallback.";
+    let summary = "Lower wide masked loads/stores, gathers and scatters to chunked loops.";
     let description = [{
         Targets with narrow vector registers (e.g. 128-bit VXE on SystemZ)
-        have no masked vector memory instructions. LLVM scalarizes a wide
-        masked load/store into per-lane branches — catastrophic for compile
-        time when BLOCK_SIZE is large.
+        have no masked vector memory instructions or gather/scatter. LLVM
+        scalarizes a wide masked load/store into per-lane branches and expands
+        a wide gather/scatter into one conditional access per lane —
+        catastrophic for compile time when BLOCK_SIZE is large.
 
         This pass rewrites each vector.maskedload / vector.maskedstore wider
         than one native register into:
@@ -258,6 +259,10 @@ def LowerWideMaskedMemoryOps : Pass<"triton-cpu-lower-wide-masked-memory-ops", "
               small masked op per chunk. LLVM still scalarizes the small op
               but only into a handful of branches inside a loop, not
               thousands in straight-line code.
+
+        Vector gathers/scatters have no useful all-active fast path, so they
+        always take the chunked form. Their index vector is spilled to a stack
+        buffer and reloaded one register per iteration.
 
         Ops that already fit in one native register are left alone.
     }];
